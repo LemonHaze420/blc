@@ -51,7 +51,7 @@
 #include <kernwin.hpp>
 #include <netnode.hpp>
 #include <typeinf.hpp>
-#include <struct.hpp>
+//#include <struct.hpp>
 #include <range.hpp>
 #include <frame.hpp>
 #include <segment.hpp>
@@ -351,6 +351,32 @@ int get_custom_viewer_line_number(TWidget* w, int* x, int* y) {
 	}
 }
 
+bool set_member_name(tid_t sid, ea_t offset, const char* name)
+{
+	tinfo_t tif;
+	if (tif.get_type_by_tid(sid) && tif.is_udt())
+	{
+		udm_t udm;
+		udm.offset = offset;
+
+		int idx = tif.find_udm(&udm, STRMEM_AUTO);
+		if (idx != -1)
+			return tif.rename_udm(idx, name) == TERR_OK;
+	}
+
+	return false;
+}
+tid_t add_struc(uval_t idx, const char* name, bool is_union)
+{
+	udt_type_data_t udt;
+	udt.is_union = is_union;
+
+	tinfo_t tif;
+	tif.create_udt(udt);
+	tif.set_named_type(nullptr, name);
+	return tif.get_tid();
+}
+
 //---------------------------------------------------------------------------
 // Keyboard callback
 static bool idaapi ct_keyboard(TWidget* w, int key, int shift, void* ud) {
@@ -395,7 +421,7 @@ static bool idaapi ct_keyboard(TWidget* w, int key, int shift, void* ud) {
 				qstring mname(word);
 
 				ea_t name_ea = get_name_ea(BADADDR, word.c_str());
-
+				
 				if (name_ea == BADADDR) {
 					//somehow the original name is invalid
 					dmsg("xref: %s has no addr\n", word.c_str());
@@ -442,7 +468,12 @@ static bool idaapi ct_keyboard(TWidget* w, int key, int shift, void* ud) {
 							}
 							if (lv->offset != BADADDR) { //stack var
 								dmsg("renaming a stack var %s to %s\n", sword.c_str(), word.c_str());
-								if (set_member_name(get_frame(dec->ida_func), lv->offset, word.c_str())) {
+								
+								tinfo_t info;
+								auto t = get_func_frame(&info, dec->ida_func);
+								// dec->ida_func->start_ea
+
+								if (set_member_name(info.get_tid(), lv->offset, word.c_str())) {
 									lv->current_name = newname;
 									dec->locals.erase(sword);
 									dec->locals[newname] = lv;
@@ -962,13 +993,14 @@ bool get_sleigh_id(string &sleigh) {
          break;
       case PLFM_386:
          //options include "System Management Mode" "Real Mode" "Protected Mode" "default"
-         sleigh += is_64 ? ":64" : (inf_is_32bit() ? ":32" : ":16");
+		  sleigh += is_64 ? ":64" : (!inf_is_16bit() ? ":32" : ":16");
          if (sleigh.find(":16") != string::npos) {
             sleigh += ":Real Mode";
          }
          else {
             sleigh += ":default";
-         }
+         }  
+		  
 
 		if (cc.id == COMP_BC) {
 			sleigh += ":borlandcpp";
@@ -1018,22 +1050,101 @@ uint64_t get_func_end(uint64_t ea) {
 	return f ? f->end_ea : BADADDR;
 }
 
+// bool get_func_frame(tinfo_t *out, const func_t *pfn);
+
+/// Get udt member TID
+/// \param idx the index of udt the member
+/// \return tid or BADADDR
+/// The tid is used to collect xrefs to the member,
+/// it can be passed to xref-related functions instead of the address.
+// tid_t get_udm_tid(size_t idx) const { return get_tinfo_property4(typid, GTA_UDM_TID, idx, 0, 0, 0); }
+
+
+//get_func_frame(frame, func);
+//...
+//tid_t* var = get_member(frame, ra - stackoff);
+
+
+
+#include <frame.hpp>
+
+tid_t* get_member(tinfo_t* tif, asize_t offset)
+{
+	udm_t udm;
+	udm.offset = offset;
+	int idx = tif->find_udm(&udm, STRMEM_AUTO);
+	if (idx != -1) {
+		auto t = tif->get_udm_tid(idx);
+		return &t;
+	}
+	return nullptr;
+}
+
+qstring get_member_name(tid_t sid, asize_t offset)
+{
+	tinfo_t tif;
+	if (tif.get_type_by_tid(sid) && tif.is_udt())
+	{
+		udm_t udm;
+		udm.offset = offset;
+
+		int idx = tif.find_udm(&udm, STRMEM_AUTO);
+		if (idx != -1)
+			return udm.name;
+	}
+
+	return qstring();
+}
+
+enum struc_error_t
+{
+	STRUC_ERROR_MEMBER_OK = 0,  ///< success
+	STRUC_ERROR_MEMBER_NAME = -1, ///< already has member with this name (bad name)
+	STRUC_ERROR_MEMBER_OFFSET = -2, ///< already has member at this offset
+	STRUC_ERROR_MEMBER_SIZE = -3, ///< bad number of bytes or bad sizeof(type)
+	STRUC_ERROR_MEMBER_TINFO = -4, ///< bad typeid parameter
+	STRUC_ERROR_MEMBER_STRUCT = -5, ///< bad struct id (the 1st argument)
+	STRUC_ERROR_MEMBER_UNIVAR = -6, ///< unions can't have variable sized members
+	STRUC_ERROR_MEMBER_VARLAST = -7, ///< variable sized member should be the last member in the structure
+	STRUC_ERROR_MEMBER_NESTED = -8, ///< recursive structure nesting is forbidden
+};
+
+
+#include <expr.hpp>
+
+struc_error_t add_struc_member(tid_t sid, const char* fieldname, ea_t offset, flags64_t flag,
+	const opinfo_t* mt, asize_t nbytes)
+{
+	qstring name_user;
+	if (fieldname)
+		qstr2user(&name_user, fieldname);
+
+	idc_value_t result;
+	idc_value_t args[6] = { sid, name_user, offset, flag, mt ? mt->tid : BADADDR, nbytes };
+	call_idc_func(&result, "add_struc_member", args, 6);
+	return static_cast<struc_error_t>(result.num);
+}
 //Create a Ghidra to Ida name mapping for a single loval variable (including formal parameters)
 void map_var_from_decl(Decompiled* dec, VarDecl* decl) {
+
 	Function* ast = dec->ast;
 	func_t* func = dec->ida_func;
-	struc_t* frame = get_frame(func);
+
+	tinfo_t frame;
+	get_func_frame(&frame, func);
+
+	//struc_t* frame = get_frame(func);
 	ea_t ra = frame_off_retaddr(func);
 	const string gname = decl->getName();
 	size_t stack = gname.find("Stack");
 	LocalVar* lv = new LocalVar(gname, gname);  //default current name will be ghidra name
 	if (stack != string::npos) {         //if it's a stack var, change current to ida name
 		uint32_t stackoff = strtoul(&gname[stack + 5], NULL, 0);
-		member_t* var = get_member(frame, ra - stackoff);
-		lv->offset = ra - stackoff;
+		auto ea = ra - stackoff;
+		tid_t * var = get_member(&frame, ea);
+		lv->offset = ea;
 		if (var) {                        //now we know there's an ida name assigned
-			qstring iname;
-			get_member_name(&iname, var->id);
+			qstring iname = get_member_name(*var, ea);
 			ast->rename(gname, iname.c_str());
 			dec->locals[iname.c_str()] = lv;
 			lv->current_name = iname.c_str();
@@ -1043,7 +1154,7 @@ void map_var_from_decl(Decompiled* dec, VarDecl* decl) {
 		   //       the new data member
 			qstring iname;
 			iname.sprnt("var_%X", stackoff - func->frregs);
-			if (add_struc_member(frame, iname.c_str(), ra - stackoff, byte_flag(), NULL, 1) == 0) {
+			if (add_struc_member(*var, iname.c_str(), ra - stackoff, byte_flag(), NULL, 1) == 0) {
 				ast->rename(gname, iname.c_str());
 				dec->locals[iname.c_str()] = lv;
 				lv->current_name = iname.c_str();
